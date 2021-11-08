@@ -1,0 +1,10 @@
+[Unit]
+Description=Heatpump Connector Daemon
+
+[Service]
+Type=forking
+PIDFile=/var/run/lwzd.pid
+ExecStart=/usr/local/sbin/lwzd --daemonify
+
+[Install]
+WantedBy=multi-user.target

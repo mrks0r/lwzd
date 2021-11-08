@@ -1,0 +1,394 @@
+#!/usr/bin/perl
+
+use Device::SerialPort;
+use Getopt::Long ();
+use POSIX;
+use DBI;
+
+my ($daemonify, $uid, $gid, $help, $debug);
+Getopt::Long::GetOptions('daemonify' => \$daemonify, 'uid=s' => \$uid, 'gid=s' => \$gid, help => \$help, debug => \$debug);
+
+if ($help) {
+    die "$0 [--daemonify [--uid <uid>] [--gid <gid>]] [--debug] [--help]\n";
+}
+
+if ($> != 0) {
+    die "This script needs root privileges.\n";
+}
+
+if ($daemonify) {
+    daemonify('lwzd', $uid, $gid);
+}
+
+my $port = Device::SerialPort->new('/dev/ttyUSB0') or die $!;
+
+$port->baudrate(115200);
+$port->databits(8);
+$port->parity("none");
+$port->stopbits(1);
+
+$port->read_char_time(0);
+$port->read_const_time(100);
+
+my $dbh;
+my @command_queue = ();
+
+my @cron = ( 
+    { period => 5, job => sub { queue_command('FD') } },
+    { period => 5, job => sub { queue_command('FB') } },
+    { period => 5, job => sub { queue_command('F4') } },
+    { period => 30, job => \&store_to_database },
+);
+
+my $callback = { 
+    'FD' => \&cb_firmware,
+    'FB' => \&cb_global,
+    'F4' => \&cb_hc1,
+};
+
+my %captured;
+
+while (1) {
+
+    my $hex_str = _read_serial();
+    if ($hex_str) {
+        my ($cmd, $arg) = _decode_telegram($hex_str);
+
+        if (not defined $cmd) {
+            print "Error: $arg\n";
+            sleep 4;
+
+        } elsif ($cmd eq '') {
+            next; # Sequence ongoing
+
+        } else {
+            print "# Dispatching, cmd: $cmd, arg: $arg\n" if $debug;
+
+            if (exists $callback->{$cmd}) {
+                &{$callback->{$cmd}}($cmd, $arg);
+            }
+        }
+    }
+
+    shift @command_queue;
+    sleep 1;
+
+    for (@cron) {
+        $_->{t} //= time();
+        if (time() > $_->{t} + $_->{period}) {
+            $_->{t} = time();
+            &{$_->{job}};
+        }
+    }
+
+    if (@command_queue > 0) {
+        _send_serial('02'); # start sequence
+        next;
+    }
+}
+
+sub cb_firmware {
+    my ($cmd, $arg) = @_;
+    my @parser = (
+        ['firmware_version', 'n', 100]
+    );
+
+    %captured = (%captured, _parse_arg($arg, @parser));
+}
+
+sub cb_global {
+    my ($cmd, $arg) = @_;
+
+    my @parser = (
+        ['collector_temp', 's>', 10],
+        ['outside_temp', 's>', 10],
+        ['hc1_flow_temp', 's>', 10],
+        ['hc1_return_temp', 's>', 10],
+        ['hotgas_temp', 's>', 10],
+        ['hotwater_temp', 's>', 10],
+        ['hc2_flow_temp', 's>', 10],
+        ['inside_temp', 's>', 10],
+        ['evaporator_temp', 's>', 10],
+        ['condenser_temp', 's>', 10],
+        ['# bits 1', 'C', 1],
+        ['# bits 2', 'C', 1],
+        ['# bits 3', 'C', 1],
+        ['output_fan_power', 's>', 10],
+        ['input_fan_power', 's>', 10],
+        ['main_fan_power', 's>', 10],
+        ['output_fan_speed', 's>', 1],
+        ['input_fan_speed', 's>', 1],
+        ['main_fan_speed', 's>', 1],
+        ['outside_temp_filtered', 's>', 10],
+        ['rel_humidity', 's>', 10],
+        ['dew_point', 's>', 10],
+        ['P_Nd', 's>', 100],
+        ['P_Hd', 's>', 100],
+        ['actual_power_qc', 'f', 1],
+        ['actual_power_pel', 'f', 1],
+        ['electric_power', 's>', 1]
+    );
+        
+    %captured = (%captured, _parse_arg($arg, @parser));
+}
+
+sub cb_hc1 {
+    my ($cmd, $arg) = @_;
+
+    my @parser = (
+        ['outside_temp', 's>', 10],
+        ['# x08', 's>', 10],
+        ['hc1_return_temp', 's>', 10],
+        ['hc1_integral_heat', 's>', 1],
+        ['hc1_flow_temp', 's>', 10],
+        ['hc1_heat_set_temp', 's>', 10],
+        ['hc1_heat_temp', 's>', 10],
+        ['hc1_on_hysteresis_no', 'C', 1],
+        ['hc1_off_hysteresis_no', 'C', 1],
+        ['hc1_booster_stage', 'C', 1],
+        ['season_mode', 'C', 1, sub { ('','winter','summer')[$_[0]] }],
+        ['# x40', 's>', 1],
+        ['hc1_integral_switch', 's>', 1],
+        ['hc1_opmode', 'C', 1],
+        ['# ?', 'C', 1],
+        ['# ?', 'C', 1],
+        ['# x52', 'C', 1],
+        ['room_set_temp', 's>', 10],
+    );
+
+    %captured = (%captured, _parse_arg($arg, @parser));
+}
+
+sub _parse_arg {
+    my ($arg, @parser) = @_;
+    
+    my $template = join('', map { $_->[1] } @parser);
+    print "# Parsing with template: $template\n" if $debug;
+
+    my @raw = unpack($template, pack('H*', $arg));
+   
+    my %ret = (); 
+    for (0..$#parser) {
+        next if $parser[$_]->[0] =~ /^#/;
+
+        my $val = $raw[$_] / $parser[$_]->[2];
+        if ($parser[$_]->[3]) {
+            $val = &{$parser[$_]->[3]}($val);
+        }
+        $ret{$parser[$_]->[0]} = $val;
+        print "!! ".$parser[$_]->[0].": $val\n" if $debug;
+    }
+
+    return %ret;
+}
+
+sub queue_command {
+    my ($cmd, $arg, $is_set) = @_;
+    $arg //= '';
+
+    push @command_queue, ["$cmd$arg", $is_set];
+}
+
+sub store_to_database {
+
+    unless ($dbh and $dbh->ping) {
+        print "# Connecting to database\n" if $debug;
+        $dbh = DBI->connect('DBI:mysql:home:localhost', 'home');
+        unless ($dbh and $dbh->ping) {
+            return undef;
+        }
+    }
+
+    my @label = qw(
+        outside_temp hotwater_temp 
+        hc1_return_temp hc1_flow_temp hc1_heat_set_temp hc1_heat_temp hc1_booster_stage
+        output_fan_power input_fan_power main_fan_power
+        output_fan_speed input_fan_speed main_fan_speed
+    );
+    
+    print "# Storing to table lwz: ".join(', ', @label)."\n" if $debug;
+    my $sth = $dbh->prepare('INSERT INTO lwz ('.join(',', @label, 'created').') VALUES ('.('?,' x ($#label+1)).'NOW())');
+    $sth->execute(map { $captured{$_} } @label);
+}
+
+
+sub _decode_telegram {
+    my $hex_str = shift;
+
+    if ($hex_str =~ /^01(..)(..)(0[A-C].{4}|..)(.+)1003$/) {
+        my ($status, $checksum, $command, $arg)  = ($1, hex($2), $3, $4);
+
+        if ($status ne '00' and $status ne '80') {
+            return undef, 'Status: $status';
+        }
+
+        # unescape
+        for ($command, $arg) {
+            $_ = join ' ', (m/../g);
+            s/10 10/10/g;
+            s/2B 18/2B/g;
+            s/ //g;
+        }
+         
+        for ('01', $status, $command =~ m/../g, $arg =~ m/../g) {
+            $checksum -= hex($_);
+        }
+
+        if ($checksum % 256 != 0) {
+            return undef, 'Checksum mismatch';
+        }
+
+        return ($command, $arg);
+    
+    } elsif ($hex_str =~ /^10$/) {
+        # Greeting received, sending command
+        _send_command(@{$command_queue[0]});
+        return '';
+
+    } elsif ($hex_str =~ /^1002$/) {
+        # Command successful, requesting data
+        _send_serial('10');
+        return '';
+    }
+
+    return undef, 'Unknown telegram';
+}
+
+sub _send_command {
+    my ($cmd, $is_set) = @_;
+
+    my @str = ('01');
+    if ($is_set) {
+        die "Not supported right now!\n";
+        push @str, '80';
+    } else {
+        push @str, '00';
+    }
+
+    my $checksum = 0;
+    for (@str, $cmd =~ m/../g) {
+        $checksum += hex($_);
+    }
+
+    push @str, sprintf("%02X", ($checksum % 256));
+    push @str, $cmd =~ m/../g;
+
+    for (@str) { # escaping
+        s/10/1010/;
+        s/2B/2B18/;
+    }
+
+    push @str, '1003'; # footer
+
+    _send_serial(join '', @str);
+}
+
+sub _send_serial {
+    my $hex_str = shift;
+    print "# Sending: $hex_str\n" if $debug;
+ 
+    $port->write(pack('H*', $hex_str));
+}
+
+sub _read_serial {
+    my ($count, $data) = $port->read(255);
+    if ($count > 0) {
+        my $hex_str = uc unpack('H*', $data);
+        
+        print "# Got: $hex_str\n" if $debug;
+        return $hex_str;
+    }
+
+    return '';
+}
+
+sub daemonify {
+    my ($name, $set_uid, $set_gid) = @_;    
+
+    my $pidfile = "/var/run/$name.pid";
+    my $pid;
+
+    if ($pidfile && -f $pidfile) {
+        open(PID, "< $pidfile");
+        $pid = <PID>;
+        close(PID);
+        
+        $pid =~ s/\D+//g;
+
+        if (kill 0 => $pid) {
+            die "The Daemon is still alive. (PID $pid)\n";
+        }
+
+        unlink $pidfile;
+    }
+
+    my $gid;
+    if ($set_gid) {
+        $gid = ($set_gid =~ /\D/ ? scalar getgrnam($set_gid) : $set_gid);
+    }
+
+    my $uid;
+    if ($set_uid) {
+        $uid = ($set_uid =~ /\D/ ? scalar getpwnam($set_uid) : $set_uid);
+    }
+
+    # Create place for pidfile, we can't do that later
+    mkdir "/var/run/$name";
+    chown $uid || -1, $gid || -1, "/var/run/$name"; 
+    
+    if ($set_gid) {
+        if (defined $gid) {
+            POSIX::setgid($gid) or die "Unable to drop group privileges: $!\n";
+            $) = "$gid $gid";
+            if ($) ne "$gid $gid") {
+                die "Unable to drop group privileges: $!\n";
+            }
+        } else {
+            die "No such group: $gid\n";
+        }
+    }
+
+    if ($set_uid) {
+        if (defined $uid) {
+            if ($uid) {
+                POSIX::setuid($uid) or die "Unable to drop user privileges: $!\n";
+            }
+        } else {
+            die "No such user: $uid\n";
+        }
+    }
+
+    $pid = fork();
+    exit if $pid;
+    die "Unable to fork: $!\n" unless defined $pid;
+
+    # Detach from terminal
+    POSIX::setsid() or die "Unable to establish new session: $!\n";
+    $SIG{HUP} = 'IGNORE';
+
+    # Fork again to prevent possibility of acquiring a controlling terminal
+    $pid = fork();
+    exit if $pid;
+    die "Unable to fork: $!\n" unless defined $pid;
+   
+    $0 = $name;
+
+    # Create pidfile
+    umask 0022;
+    open(PID, "> $pidfile") or die $!;
+    print PID "$$\n";
+    close(PID);
+
+    # Clear umask
+    umask 0;
+
+    # Reopen descriptors 
+    open(STDIN, "< /dev/null");
+    open(STDOUT, "> /dev/null");
+    open(STDERR, ">&STDOUT"); 
+    
+    # Change working directory 
+    chdir '/tmp';
+
+    return;
+}
