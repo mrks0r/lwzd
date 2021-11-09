@@ -37,6 +37,7 @@ my @cron = (
     { period => 5, job => sub { queue_command('FD') } },
     { period => 5, job => sub { queue_command('FB') } },
     { period => 5, job => sub { queue_command('F4') } },
+    { period => 5, job => sub { queue_command('E8') } },
     { period => 30, job => \&store_to_database },
 );
 
@@ -44,6 +45,7 @@ my $callback = {
     'FD' => \&cb_firmware,
     'FB' => \&cb_global,
     'F4' => \&cb_hc1,
+    'E8' => \&cb_fan,
 };
 
 my %captured;
@@ -159,6 +161,22 @@ sub cb_hc1 {
     %captured = (%captured, _parse_arg($arg, @parser));
 }
 
+sub cb_fan {
+    my ($cmd, $arg) = @_;
+
+    my @parser = (
+        ['# ?', 'A27', 1],
+        ['input_fan_speed', 'C', 1],
+        ['output_fan_speed', 'C', 1],
+        ['input_fan_airflow', 's>', 1],
+        ['output_fan_airflow', 's>', 1],
+        ['input_fan_power', 'C', 1],
+        ['output_fan_power', 'C', 1],
+    );
+
+    %captured = (%captured, _parse_arg($arg, @parser));
+}
+
 sub _parse_arg {
     my ($arg, @parser) = @_;
     
@@ -204,6 +222,7 @@ sub store_to_database {
         hc1_return_temp hc1_flow_temp hc1_heat_set_temp hc1_heat_temp hc1_booster_stage
         output_fan_power input_fan_power main_fan_power
         output_fan_speed input_fan_speed main_fan_speed
+        output_fan_airflow input_fan_airflow
     );
     
     print "# Storing to table lwz: ".join(', ', @label)."\n" if $debug;
