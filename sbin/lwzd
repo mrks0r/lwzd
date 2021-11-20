@@ -34,11 +34,11 @@ my $dbh;
 my @command_queue = ();
 
 my @cron = ( 
-    { period => 5, job => sub { queue_command('FD') } },
-    { period => 5, job => sub { queue_command('FB') } },
-    { period => 5, job => sub { queue_command('F4') } },
-    { period => 5, job => sub { queue_command('E8') } },
-    { period => 30, job => \&store_to_database },
+#    { period => 5, job => sub { queue_command('FD') } },
+    { period => 300, job => sub { queue_command('FB') } },
+    { period => 300, job => sub { queue_command('F4') } },
+    { period => 300, job => sub { queue_command('E8') } },
+    { period => 300, job => \&store_to_database, wait_for_empty_queue => 1 },
 );
 
 my $callback = { 
@@ -51,13 +51,12 @@ my $callback = {
 my %captured;
 
 while (1) {
-
     my $hex_str = _read_serial();
     if ($hex_str) {
         my ($cmd, $arg) = _decode_telegram($hex_str);
 
         if (not defined $cmd) {
-            print "Error: $arg\n";
+            print "# Error: $arg\n" if $debug;
             sleep 4;
 
         } elsif ($cmd eq '') {
@@ -77,7 +76,8 @@ while (1) {
 
     for (@cron) {
         $_->{t} //= time();
-        if (time() > $_->{t} + $_->{period}) {
+        if (time() >= $_->{t} + $_->{period}) {
+            next if $_->{wait_for_empty_queue} and @command_queue;
             $_->{t} = time();
             &{$_->{job}};
         }
@@ -112,9 +112,30 @@ sub cb_global {
         ['inside_temp', 's>', 10],
         ['evaporator_temp', 's>', 10],
         ['condenser_temp', 's>', 10],
-        ['# bits 1', 'C', 1],
-        ['# bits 2', 'C', 1],
-        ['# bits 3', 'C', 1],
+        ['input_mixer_open', 'B8', 1],
+        ['input_mixer_closed', '', 1],
+        ['heatpipe_valve', '', 1],
+        ['diverter_valve', '', 1],
+        ['hotwater_pump_on', '', 1],
+        ['hc1_pump_on', '', 1],
+        ['# ?', '', 1],
+        ['solar_pump_on', '', 1],
+        ['# ?', 'B8', 1],
+        ['# ?', '', 1],
+        ['# ?', '', 1],
+        ['compressor_on', '', 1],
+        ['booster_stage3_on', '', 1],
+        ['booster_stage2_on', '', 1],
+        ['booster_stage1_on', '', 1],
+        ['# ?', '', 1],
+        ['high_pressure_sensor_on', 'B8', 1],
+        ['low_pressure_sensor_on', '', 1],
+        ['evaporator_ice_monitor_on', '', 1],
+        ['signal_anode', '', 1],
+        ['evu_enable', '', 1],
+        ['input_fireplace', '', 1],
+        ['input_stb', '', 1],
+        ['# ?', '', 1],
         ['output_fan_power', 's>', 10],
         ['input_fan_power', 's>', 10],
         ['main_fan_power', 's>', 10],
@@ -148,7 +169,7 @@ sub cb_hc1 {
         ['hc1_on_hysteresis_no', 'C', 1],
         ['hc1_off_hysteresis_no', 'C', 1],
         ['hc1_booster_stage', 'C', 1],
-        ['season_mode', 'C', 1, sub { ('','winter','summer')[$_[0]] }],
+        ['season_mode', 'C', 1],
         ['# x40', 's>', 1],
         ['hc1_integral_switch', 's>', 1],
         ['hc1_opmode', 'C', 1],
@@ -184,15 +205,17 @@ sub _parse_arg {
     print "# Parsing with template: $template\n" if $debug;
 
     my @raw = unpack($template, pack('H*', $arg));
-   
+
     my %ret = (); 
     for (0..$#parser) {
+        if ($parser[$_]->[1] eq 'B8') {
+            splice(@raw, $_, 1, split(//, $raw[$_]));
+        }
+
         next if $parser[$_]->[0] =~ /^#/;
 
         my $val = $raw[$_] / $parser[$_]->[2];
-        if ($parser[$_]->[3]) {
-            $val = &{$parser[$_]->[3]}($val);
-        }
+
         $ret{$parser[$_]->[0]} = $val;
         print "!! ".$parser[$_]->[0].": $val\n" if $debug;
     }
@@ -217,17 +240,32 @@ sub store_to_database {
         }
     }
 
-    my @label = qw(
+    my %label;
+
+    $label{lwz} = [qw(
         outside_temp hotwater_temp 
         hc1_return_temp hc1_flow_temp hc1_heat_set_temp hc1_heat_temp hc1_booster_stage
         output_fan_power input_fan_power main_fan_power
         output_fan_speed input_fan_speed main_fan_speed
         output_fan_airflow input_fan_airflow
-    );
+    )];
+
+    $label{lwz_debug} = [qw(
+        hotgas_temp evaporator_temp condenser_temp
+        heatpipe_valve diverter_valve hotwater_pump_on hc1_pump_on compressor_on
+        booster_stage1_on booster_stage2_on booster_stage3_on
+        high_pressure_sensor_on low_pressure_sensor_on signal_anode
+        hc1_on_hysteresis_no hc1_off_hysteresis_no hc1_opmode
+        season_mode
+    )];
     
-    print "# Storing to table lwz: ".join(', ', @label)."\n" if $debug;
-    my $sth = $dbh->prepare('INSERT INTO lwz ('.join(',', @label, 'created').') VALUES ('.('?,' x ($#label+1)).'NOW())');
-    $sth->execute(map { $captured{$_} } @label);
+    for (sort keys %label) {
+        my @label = @{$label{$_}};
+
+        print "# Storing to table $_: ".join(', ', @label)."\n" if $debug;
+        my $sth = $dbh->prepare("INSERT INTO $_ (".join(',', @label, 'created').') VALUES ('.('?,' x ($#label+1)).'NOW())');
+        $sth->execute(map { $captured{$_} } @label);
+    }
 }
 
 
