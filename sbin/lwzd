@@ -1,5 +1,6 @@
 #!/usr/bin/perl
 
+use Fcntl qw/:flock/;
 use Device::SerialPort;
 use Getopt::Long ();
 use POSIX;
@@ -18,6 +19,12 @@ if ($> != 0) {
 
 if ($daemonify) {
     daemonify('lwzd', $uid, $gid);
+}
+
+open(FH, "> /var/lock/LCK..ttyUSB0") or die $!;
+print FH sprintf("% 10d\n", $$);
+unless (flock(FH, LOCK_EX|LOCK_NB)) {
+    die "Unable to aquire lock: $!\n";
 }
 
 my $port = Device::SerialPort->new('/dev/ttyUSB0') or die $!;
